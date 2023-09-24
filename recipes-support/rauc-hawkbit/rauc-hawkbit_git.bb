@@ -1,12 +1,15 @@
-LICENSE = "LGPLv2.1"
-LIC_FILES_CHKSUM = "file://COPYING;md5=4fbd65380cdd255951079008b364516c"
+LICENSE = "LGPL-2.1-or-later"
+LIC_FILES_CHKSUM = " \
+    file://COPYING;md5=4fbd65380cdd255951079008b364516c \
+    file://README.rst;beginline=114;endline=132;md5=aff2a45fabc5c8d959b72f97ffc77465 \
+    "
 
 SUMMARY = "hawkBit client for RAUC"
 
 DEPENDS = "python3-setuptools-scm-native"
 
 SRC_URI = " \
-    git://github.com/rauc/rauc-hawkbit.git;protocol=https \
+    git://github.com/rauc/rauc-hawkbit.git;protocol=https;branch=master \
     file://rauc-hawkbit.service \
 "
 
@@ -18,10 +21,10 @@ S = "${WORKDIR}/git"
 inherit setuptools3 systemd
 
 PACKAGES =+ "${PN}-service"
-SYSTEMD_SERVICE_${PN}-service = "rauc-hawkbit.service"
+SYSTEMD_SERVICE:${PN}-service = "rauc-hawkbit.service"
 SYSTEMD_PACKAGES = "${PN}-service"
 
-do_install_append() {
+do_install:append() {
 	install -d ${D}${sysconfdir}/${BPN}/
 	install -m 0644 ${S}/rauc_hawkbit/config.cfg ${D}${sysconfdir}/${BPN}/config.cfg
 	install -d ${D}${systemd_unitdir}/system/
@@ -30,8 +33,8 @@ do_install_append() {
 		${D}${systemd_unitdir}/system/rauc-hawkbit.service
 }
 
-RDEPENDS_${PN} += "python3-aiohttp python3-gbulb"
-FILES_${PN}-service = " \
+RDEPENDS:${PN} += "python3-aiohttp python3-gbulb"
+FILES:${PN}-service = " \
     ${bindir}/rauc-hawkbit-client \
     ${sysconfdir}/${BPN}/config.cfg \
     ${systemd_unitdir}/system/rauc-hawkbit.service \

@@ -59,15 +59,21 @@ other layers needed. e.g.::
     "
 
 
-II. Building RAUC Host Tool
-===========================
+II. Building and Using RAUC Host Tool
+=====================================
 
-If you only intend to build the RAUC host tool, you may simply run::
+If you intend to build and use RAUC as a host tool from you BSP, e.g. for
+calling ``rauc info`` on your built bundle, simply run::
 
-  bitbake rauc-native
+  bitbake rauc-native -caddto_recipe_sysroot
+  oe-run-native rauc-native rauc info --keyring=/path/to/keyring.pem tmp/deploy/images/<machine>/<bundle-name>.raucb
 
 This will place the rauc binary at ``tmp/deploy/tools/rauc``.
 
+If you need to execute the ``casync`` host tool manually, you can do this by running::
+
+  bitbake casync-native -caddto_recipe_sysroot
+  oe-run-native casync-native casync --help
 
 III. Adding the RAUC Update Service to Your Device
 ==================================================
@@ -84,8 +90,7 @@ you have to follow at least the following steps:
    ``/etc/rauc/system.conf``. For information on how to write the RAUC
    update file, please refer to the RAUC user documentation [1]_::
 
-     FILESEXTRAPATHS_prepend := "${THISDIR}/files:"
-     SRC_URI_append := " file://system.conf"
+     FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 
 3. Create a bundle recipe for your device by adding a recipe
    that inherits the `bundle` class and adds all desired
@@ -112,7 +117,7 @@ you have to follow at least the following steps:
 Note: If you do not use packagegroup-base, you als need to manually add
 the `rauc` package to your systems image recipe::
 
-     IMAGE_INSTALL_append = " rauc"
+     IMAGE_INSTALL:append = " rauc"
 
 
 IV. Building The RAUC hawkBit Clients
@@ -127,7 +132,7 @@ hawkBit deployment server:
 To use ``rauc-hawkbit`` as a standalone service add to your systems image
 recipe::
 
-    IMAGE_INSTALL_append = " rauc-hawkbit-service"
+    IMAGE_INSTALL:append = " rauc-hawkbit-service"
 
 To use it as a python library in your demo application instead, simply add to
 your recipe::
@@ -136,7 +141,7 @@ your recipe::
 
 To use ``rauc-hawkbit-updater`` in your system add to your image recipe::
 
-    IMAGE_INSTALL_append = " rauc-hawkbit-updater"
+    IMAGE_INSTALL:append = " rauc-hawkbit-updater"
 
 V. Configure Custom Kernel
 ==========================
@@ -149,9 +154,57 @@ If you build your own kernel with a full custom ``defconfig`` file, you have to
 make sure that the options in ``recipes-kernel/linux/linux-yocto/rauc.cfg`` are
 enabled in your configuration, too.
 
+VI. Build RAUC Development Version
+==================================
 
-VI. References
-==============
+Beside the standard release version recipes, the _git variants of RAUC recipes
+allow to build RAUC from a master branch revision that is newer than the latest
+release.
+
+This is especially useful for early testing and adaption to upcoming features
+in RAUC.
+
+By default, the _git recipes are disabled. To enable it, you can set::
+
+  RAUC_USE_DEVEL_VERSION = "1"
+
+in your local.conf. Note that this has the same effect as setting
+``DEFAULT_PREFERENCE = "1"`` for each recipe (target/native/nativesdk)
+individually.
+
+VII. Contributing
+=================
+
+To report bugs, file a new `issue <https://github.com/rauc/meta-rauc/issues>`_
+on GitHub.
+
+For fixing bugs, bumping recipes or adding new features, open a `pull request
+<https://github.com/rauc/meta-rauc/pulls>`_ on GitHub.
+
+Add a ``Signed-off-by`` line to your commits according to the
+`Developer’s Certificate of Origin
+<https://github.com/rauc/meta-rauc/blob/master/DCO>`_.
+
+Backporting
+-----------
+
+For backporting changes to a stable or LTS branch, two options exist:
+
+a) drop a backport request in the original pull request
+b) backport on your own and create a new pull request
+
+When doing backports on your own, make sure to include a cherry-pick note and
+the original commit-ish in a line below the original Signed-off-by and add your
+own Signed-off-by below.
+When using git, this can be done automatically with::
+
+  git cherry-pick -xs <commit-ish>
+
+Note that backports will be acccepted for actively maintained `poky releases
+<https://wiki.yoctoproject.org/wiki/Releases>`_ only!
+
+VIII. References
+================
 
 .. [1] http://rauc.readthedocs.io/en/latest/
 

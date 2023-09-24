@@ -17,6 +17,7 @@
 #   RAUC_SLOT_rootfs ?= "core-image-minimal"
 #   RAUC_SLOT_rootfs[fstype] = "ext4"
 #   RAUC_SLOT_rootfs[hooks] ?= "install;post-install"
+#   RAUC_SLOT_rootfs[adaptive] ?= "block-hash-index"
 #   
 #   RAUC_SLOT_kernel ?= "linux-yocto"
 #   RAUC_SLOT_kernel[type] ?= "kernel"
@@ -41,7 +42,12 @@
 #
 # To prepend an offset to a bootloader image, set the following parameter in bytes.
 # Optionally you can use units allowed by 'dd' e.g. 'K','kB','MB'.
+# If the offset is negative, bytes will not be added, but removed.
 #   RAUC_SLOT_bootloader[offset] ?= "0"
+#
+# Enable building verity format bundles with
+#
+#   RAUC_BUNDLE_FORMAT = "verity"
 #
 # To add additional artifacts to the bundle you can use RAUC_BUNDLE_EXTRA_FILES
 # and RAUC_BUNDLE_EXTRA_DEPENDS.
@@ -73,8 +79,23 @@
 # Enable building casync bundles with
 #
 #   RAUC_CASYNC_BUNDLE = "1"
+#
+# To define custom manifest 'meta' sections, you may use
+# 'RAUC_META_SECTIONS' as follows:
+#
+#   RAUC_META_SECTIONS = "mydata foo"
+#
+#   RAUC_META_mydata[release-type] = "beta"
+#   RAUC_META_mydata[release-notes] = "a few notes here"
+#
+#   RAUC_META_foo[bar] = "baz"
+#
+# Adding any sort of additional lines to the manifest can be done with the
+# RAUC_MANIFEST_EXTRA_LINES variable (using '\n' to indicate newlines):
+#
+#   RAUC_MANIFEST_EXTRA_LINES = "[section]\nkey=value\n"
 
-LICENSE = "MIT"
+LICENSE ?= "MIT"
 
 PACKAGE_ARCH = "${MACHINE_ARCH}"
 
@@ -88,9 +109,9 @@ do_fetch[cleandirs] = "${S}"
 do_patch[noexec] = "1"
 do_compile[noexec] = "1"
 do_install[noexec] = "1"
-do_populate_sysroot[noexec] = "1"
+deltask do_populate_sysroot
 do_package[noexec] = "1"
-do_package_qa[noexec] = "1"
+deltask do_package_qa
 do_packagedata[noexec] = "1"
 deltask do_package_write_ipk
 deltask do_package_write_deb
@@ -113,6 +134,9 @@ RAUC_BUNDLE_EXTRA_FILES[doc] = "Specifies list of additional files to add to bun
 RAUC_BUNDLE_EXTRA_DEPENDS[doc] = "Specifies list of recipes that create artifacts in DEPLOY_DIR_IMAGE. For recipes not depending on do_deploy task also <recipename>:do_<taskname> notation is supported"
 
 RAUC_CASYNC_BUNDLE ??= "0"
+
+RAUC_BUNDLE_FORMAT ??= ""
+RAUC_BUNDLE_FORMAT[doc] = "Specifies the bundle format to be used (plain/verity)."
 
 # Create dependency list from images
 python __anonymous() {
@@ -137,14 +161,15 @@ python __anonymous() {
 
         if imgtype == 'image':
             d.appendVarFlag('do_unpack', 'depends', ' ' + image + ':do_image_complete')
+            d.appendVarFlag('do_rm_work_all', 'depends', ' ' + image + ':do_rm_work_all')
         else:
             d.appendVarFlag('do_unpack', 'depends', ' ' + image + ':do_deploy')
 
     for image in (d.getVar('RAUC_BUNDLE_EXTRA_DEPENDS') or "").split():
         imagewithdep = image.split(':')
         deptask = imagewithdep[1] if len(imagewithdep) > 1 else 'do_deploy'
-        d.appendVarFlag('do_unpack', 'depends', ' %s:%s' % (image, deptask))
-        bb.note('adding extra dependency %s:%s' % (image,  deptask))
+        d.appendVarFlag('do_unpack', 'depends', ' %s:%s' % (imagewithdep[0], deptask))
+        bb.note('adding extra dependency %s:%s' % (imagewithdep[0],  deptask))
 }
 
 S = "${WORKDIR}"
@@ -169,6 +194,7 @@ DEPENDS += "${@bb.utils.contains('RAUC_CASYNC_BUNDLE', '1', 'virtual/fakeroot-na
 def write_manifest(d):
     import shutil
     import subprocess
+    from pathlib import PurePath
 
     machine = d.getVar('MACHINE')
     bundle_path = d.expand("${BUNDLE_DIR}")
@@ -185,6 +211,15 @@ def write_manifest(d):
     manifest.write(d.expand('description=${RAUC_BUNDLE_DESCRIPTION}\n'))
     manifest.write(d.expand('build=${RAUC_BUNDLE_BUILD}\n'))
     manifest.write('\n')
+
+    if d.getVar('RAUC_BUNDLE_FORMAT'):
+        manifest.write('[bundle]\n')
+        manifest.write(d.expand('format=${RAUC_BUNDLE_FORMAT}\n'))
+        manifest.write('\n')
+    else:
+        bb.warn('No RAUC_BUNDLE_FORMAT set. This will default to using legacy \'plain\' format.'
+                '\nIf you are unsure, set RAUC_BUNDLE_FORMAT = "verity" for new projects.'
+                '\nRefer to https://rauc.readthedocs.io/en/latest/reference.html#sec-ref-formats for more information about RAUC bundle formats.')
 
     hooksflags = d.getVarFlags('RAUC_BUNDLE_HOOKS')
     have_hookfile = False
@@ -219,7 +254,7 @@ def write_manifest(d):
             if slotflags and 'file' in slotflags:
                 imgsource = d.getVarFlag('RAUC_SLOT_%s' % slot, 'file')
             else:
-                imgsource = "%s-%s.%s" % (d.getVar('RAUC_SLOT_%s' % slot), machine, img_fstype)
+                imgsource = "%s-%s.rootfs.%s" % (d.getVar('RAUC_SLOT_%s' % slot), machine, img_fstype)
             imgname = imgsource
         elif imgtype == 'kernel':
             # TODO: Add image type support
@@ -246,15 +281,28 @@ def write_manifest(d):
         if slotflags and 'rename' in slotflags:
             imgname = d.getVarFlag('RAUC_SLOT_%s' % slot, 'rename')
         if slotflags and 'offset' in slotflags:
-            imgoffset = slotflags.get('offset')
-            if slotflags.get('offset') == '':
+            padding = 'seek'
+            imgoffset = d.getVarFlag('RAUC_SLOT_%s' % slot, 'offset')
+            if imgoffset:
+                sign, magnitude = imgoffset[:1], imgoffset[1:]
+                if sign == '+':
+                    padding = 'seek'
+                    imgoffset = magnitude
+                elif sign == '-':
+                    padding = 'skip'
+                    imgoffset = magnitude
+            if imgoffset == '':
                 imgoffset = '0'
 
+        # Keep only the image name in case the image is in a $DEPLOY_DIR_IMAGE subdirectory
+        imgname = PurePath(imgname).name
         manifest.write("filename=%s\n" % imgname)
         if slotflags and 'hooks' in slotflags:
             if not have_hookfile:
                 bb.warn("A hook is defined for slot %s, but RAUC_BUNDLE_HOOKS[file] is not defined" % slot)
-            manifest.write("hooks=%s\n" % slotflags.get('hooks'))
+            manifest.write("hooks=%s\n" % d.getVarFlag('RAUC_SLOT_%s' % slot, 'hooks'))
+        if slotflags and 'adaptive' in slotflags:
+            manifest.write("adaptive=%s\n" % d.getVarFlag('RAUC_SLOT_%s' % slot, 'adaptive'))
         manifest.write("\n")
 
         bundle_imgpath = "%s/%s" % (bundle_path, imgname)
@@ -263,8 +311,9 @@ def write_manifest(d):
         if os.path.isfile(searchpath):
             if imgtype == 'boot' and 'offset' in slotflags and imgoffset != '0':
                 subprocess.call(['dd', 'if=%s' % searchpath,
-                                 'of=%s' % bundle_imgpath, 'oflag=seek_bytes',
-                                 'seek=%s' % imgoffset])
+                                 'of=%s' % bundle_imgpath,
+                                 'iflag=skip_bytes', 'oflag=seek_bytes',
+                                 '%s=%s' % (padding, imgoffset)])
             else:
                 shutil.copy(searchpath, bundle_imgpath)
         else:
@@ -276,18 +325,50 @@ def write_manifest(d):
         if not os.path.exists(bundle_imgpath):
             raise bb.fatal("Failed adding image '%s' to bundle: not present in DEPLOY_DIR_IMAGE or WORKDIR" % imgsource)
 
+    for meta_section in (d.getVar('RAUC_META_SECTIONS') or "").split():
+        manifest.write("[meta.%s]\n" % meta_section)
+        for meta_key in d.getVarFlags('RAUC_META_%s' % meta_section):
+            meta_value = d.getVarFlag('RAUC_META_%s' % meta_section, meta_key)
+            manifest.write("%s=%s\n" % (meta_key, meta_value))
+        manifest.write("\n");
+
+    manifest.write((d.getVar('RAUC_MANIFEST_EXTRA_LINES') or "").replace(r'\n', '\n'))
+
     manifest.close()
+
+def try_searchpath(file, d):
+    searchpath = d.expand("${DEPLOY_DIR_IMAGE}/%s") % file
+    if os.path.isfile(searchpath):
+        bb.note("adding extra file from deploy dir to bundle dir: '%s'" % file)
+        return searchpath
+    elif os.path.isdir(searchpath):
+        bb.note("adding extra directory from deploy dir to bundle dir: '%s'" % file)
+        return searchpath
+
+    searchpath = d.expand("${WORKDIR}/%s") % file
+    if os.path.isfile(searchpath):
+        bb.note("adding extra file from workdir to bundle dir: '%s'" % file)
+        return searchpath
+    elif os.path.isdir(searchpath):
+        bb.note("adding extra directory from workdir to bundle dir: '%s'" % file)
+        return searchpath
+
+    return None
 
 python do_configure() {
     import shutil
     import os
     import stat
+    import subprocess
 
     write_manifest(d)
 
     hooksflags = d.getVarFlags('RAUC_BUNDLE_HOOKS')
     if hooksflags and 'file' in hooksflags:
         hf = hooksflags.get('file')
+        if not os.path.exists(d.expand("${WORKDIR}/%s" % hf)):
+            bb.error("hook file '%s' does not exist in WORKDIR" % hf)
+            return
         dsthook = d.expand("${BUNDLE_DIR}/%s" % hf)
         bb.note("adding hook file to bundle dir: '%s'" % hf)
         shutil.copy(d.expand("${WORKDIR}/%s" % hf), dsthook)
@@ -295,33 +376,45 @@ python do_configure() {
         os.chmod(dsthook, st.st_mode | stat.S_IEXEC)
 
     for file in (d.getVar('RAUC_BUNDLE_EXTRA_FILES') or "").split():
-        searchpath = d.expand("${DEPLOY_DIR_IMAGE}/%s") % file
+        bundledir = d.getVar('BUNDLE_DIR')
         destpath = d.expand("${BUNDLE_DIR}/%s") % file
-        if os.path.isfile(searchpath):
-            bb.note("adding extra file from deploy dir to bundle dir: '%s'" % file)
-            shutil.copy(searchpath, destpath)
-            continue
 
-        searchpath = d.expand("${WORKDIR}/%s") % file
-        if os.path.isfile(searchpath):
-            bb.note("adding extra file from workdir to bundle dir: '%s'" % file)
-            shutil.copy(searchpath, destpath)
-            continue
+        searchpath = try_searchpath(file, d)
+        if not searchpath:
+            bb.error("extra file '%s' neither found in workdir nor in deploy dir!" % file)
 
-        bb.error("extra file '%s' neither found in workdir nor in deploy dir!" % file)
+        destdir = '.'
+        # strip leading and trailing slashes to prevent installting into wrong location
+        file = file.rstrip('/').lstrip('/')
+
+        if file.find("/") != -1:
+            destdir = file.rsplit("/", 1)[0] + '/'
+            bb.utils.mkdirhier("%s/%s" % (bundledir, destdir))
+        bb.note("Unpacking %s to %s/" % (file, bundledir))
+        ret = subprocess.call('cp -fpPRH "%s" "%s"' % (searchpath, destdir), shell=True, cwd=bundledir)
 }
 
 do_configure[cleandirs] = "${BUNDLE_DIR}"
 
 BUNDLE_BASENAME ??= "${PN}"
-BUNDLE_BASENAME[doc] = "Specifies desired output base name of generated bundle."
+BUNDLE_BASENAME[doc] = "Specifies desired output base name of generated RAUC bundle."
 BUNDLE_NAME ??= "${BUNDLE_BASENAME}-${MACHINE}-${DATETIME}"
-BUNDLE_NAME[doc] = "Specifies desired full output name of generated bundle."
+BUNDLE_NAME[doc] = "Specifies desired full output name of generated RAUC bundle."
 # Don't include the DATETIME variable in the sstate package sigantures
 BUNDLE_NAME[vardepsexclude] = "DATETIME"
 BUNDLE_LINK_NAME ??= "${BUNDLE_BASENAME}-${MACHINE}"
 BUNDLE_EXTENSION ??= ".raucb"
-BUNDLE_EXTENSION[doc] = "Specifies desired custom filename extension of generated bundle"
+BUNDLE_EXTENSION[doc] = "Specifies desired custom filename extension of generated RAUC bundle."
+
+CASYNC_BUNDLE_BASENAME ??= "casync-${BUNDLE_BASENAME}"
+CASYNC_BUNDLE_BASENAME[doc] = "Specifies desired output base name of generated RAUC casync bundle."
+CASYNC_BUNDLE_NAME ??= "${CASYNC_BUNDLE_BASENAME}-${MACHINE}-${DATETIME}"
+CASYNC_BUNDLE_NAME[doc] = "Specifies desired full output name of generated RAUC casync bundle."
+# Don't include the DATETIME variable in the sstate package sigantures
+CASYNC_BUNDLE_NAME[vardepsexclude] = "DATETIME"
+CASYNC_BUNDLE_LINK_NAME ??= "${CASYNC_BUNDLE_BASENAME}-${MACHINE}"
+CASYNC_BUNDLE_EXTENSION ??= "${BUNDLE_EXTENSION}"
+CASYNC_BUNDLE_EXTENSION[doc] = "Specifies desired custom filename extension of generated RAUC casync bundle."
 
 do_bundle() {
 	if [ -z "${RAUC_KEY_FILE}" ]; then
@@ -351,8 +444,9 @@ do_bundle() {
 		if ! [ -x "$(command -v fakeroot)" ]; then
 			ln -sf ${STAGING_DIR_NATIVE}${bindir}/pseudo ${STAGING_DIR_NATIVE}${bindir}/fakeroot
 		fi
-		PSEUDO_PREFIX=${STAGING_DIR_NATIVE}/usr ${STAGING_DIR_NATIVE}${bindir}/rauc convert \
+		PSEUDO_PREFIX=${STAGING_DIR_NATIVE}/usr PSEUDO_DISABLED=0 ${STAGING_DIR_NATIVE}${bindir}/rauc convert \
 			--debug \
+			--trust-environment \
 			--cert=${RAUC_CERT_FILE} \
 			--key=${RAUC_KEY_FILE} \
 			--keyring=${RAUC_KEYRING_FILE} \
@@ -364,7 +458,7 @@ do_bundle() {
 do_bundle[dirs] = "${B}"
 do_bundle[cleandirs] = "${B}"
 
-addtask bundle after do_configure before do_build
+addtask bundle after do_configure
 
 inherit deploy
 
@@ -374,10 +468,10 @@ do_deploy() {
 	ln -sf ${BUNDLE_NAME}${BUNDLE_EXTENSION} ${DEPLOYDIR}/${BUNDLE_LINK_NAME}${BUNDLE_EXTENSION}
 
 	if [ ${RAUC_CASYNC_BUNDLE} -eq 1 ]; then
-		install ${B}/casync-bundle${BUNDLE_EXTENSION} ${DEPLOYDIR}/casync-${BUNDLE_NAME}${BUNDLE_EXTENSION}
-		cp -r ${B}/casync-bundle.castr ${DEPLOYDIR}/casync-${BUNDLE_NAME}.castr
-		ln -sf casync-${BUNDLE_NAME}${BUNDLE_EXTENSION} ${DEPLOYDIR}/casync-${BUNDLE_LINK_NAME}${BUNDLE_EXTENSION}
-		ln -sf casync-${BUNDLE_NAME}.castr ${DEPLOYDIR}/casync-${BUNDLE_LINK_NAME}.castr
+		install -m 0644 ${B}/casync-bundle.raucb ${DEPLOYDIR}/${CASYNC_BUNDLE_NAME}${CASYNC_BUNDLE_EXTENSION}
+		cp -r ${B}/casync-bundle.castr ${DEPLOYDIR}/${CASYNC_BUNDLE_NAME}.castr
+		ln -sf ${CASYNC_BUNDLE_NAME}${CASYNC_BUNDLE_EXTENSION} ${DEPLOYDIR}/${CASYNC_BUNDLE_LINK_NAME}${CASYNC_BUNDLE_EXTENSION}
+		ln -sf ${CASYNC_BUNDLE_NAME}.castr ${DEPLOYDIR}/${CASYNC_BUNDLE_LINK_NAME}.castr
 	fi
 }
 
